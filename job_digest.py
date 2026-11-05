@@ -3,7 +3,8 @@
 Remote DevOps/SRE job digest.
 
 What it does (no logins, no auto-applying):
-  1. Pulls public remote-job feeds (Remotive, Remote OK, We Work Remotely, Himalayas)
+  1. Pulls public remote-job feeds (Remotive, Remote OK, We Work Remotely, Himalayas,
+     Jobicy, Working Nomads) and company career pages (Greenhouse/Lever/Ashby)
   2. Keeps only DevOps/SRE/Cloud roles that are open to candidates in India
   3. Removes suspected fake/scam postings, stale posts and dead links
   4. Scores each job against your skills (GCP, GKE, Terraform, Istio, ...)
@@ -44,7 +45,7 @@ import requests
 # --------------------------------------------------------------------------
 # CONFIG - edit these to tune the digest
 # --------------------------------------------------------------------------
-MAX_AGE_DAYS = 14               # ignore postings older than this
+MAX_AGE_DAYS = 5               # ignore postings older than this
 MAX_REQUIRED_YEARS = 8         # skip jobs that ask for more than this many years
 MIN_SCORE = 5                  # minimum skill-match score to be listed
 ALLOW_UNCLEAR_LOCATION = False # True = also list jobs whose location can't be determined
@@ -55,6 +56,20 @@ SEEN_KEEP_DAYS = 60
 
 # Companies you never want to see (lowercase)
 COMPANY_BLOCKLIST: set[str] = set()
+
+# Company career pages (jobs straight from the employer, so they can't be fake).
+# The slug is the last part of the careers URL:
+#   boards.greenhouse.io/gitlab        -> GREENHOUSE_BOARDS = ["gitlab"]
+#   jobs.lever.co/<name>               -> LEVER_BOARDS = ["<name>"]
+#   jobs.ashbyhq.com/<name>            -> ASHBY_BOARDS = ["<name>"]
+# A wrong slug is harmless: it is reported as "not found" in the email footer.
+# Only roles marked remote AND open to India are kept.
+GREENHOUSE_BOARDS = [
+    "gitlab", "elastic", "grafanalabs", "canonical", "mongodb", "databricks",
+    "twilio", "okta", "stripe", "cloudflare", "datadog",
+]
+LEVER_BOARDS: list[str] = []
+ASHBY_BOARDS: list[str] = []
 
 # Job titles we want / don't want
 TITLE_INCLUDE = re.compile(
@@ -164,6 +179,8 @@ class Job:
     description: str = ""
     score: int = 0
     matched: list = field(default_factory=list)
+    remote_ok: bool = True   # False = role is not remote (office/hybrid)
+    trusted: bool = False    # True = posted on the employer's own career page
 
 
 def strip_html(s: str) -> str:
@@ -220,6 +237,11 @@ def http_get(session: requests.Session, url: str, **kw) -> requests.Response:
             r = session.get(url, timeout=25, **kw)
             r.raise_for_status()
             return r
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise  # not found: retrying will not help
+            last = e
+            time.sleep(1.5 * (attempt + 1))
         except requests.RequestException as e:
             last = e
             time.sleep(1.5 * (attempt + 1))
@@ -231,7 +253,8 @@ def http_get(session: requests.Session, url: str, **kw) -> requests.Response:
 # --------------------------------------------------------------------------
 def fetch_remotive(s: requests.Session) -> list[Job]:
     jobs = []
-    for params in ({"category": "devops", "limit": 150}, {"search": "kubernetes", "limit": 100}):
+    for params in ({"category": "devops", "limit": 150}, {"search": "kubernetes", "limit": 100},
+                   {"search": "sre", "limit": 100}):
         data = http_get(s, "https://remotive.com/api/remote-jobs", params=params).json()
         for it in data.get("jobs", []):
             jobs.append(Job(
@@ -298,11 +321,159 @@ def fetch_himalayas(s: requests.Session) -> list[Job]:
     return jobs
 
 
+def _first(it: dict, *keys, default=""):
+    """Return the first non-empty value among several possible field names."""
+    for k in keys:
+        v = it.get(k)
+        if v not in (None, "", []):
+            return v
+    return default
+
+
+def _join(v) -> str:
+    return ", ".join(str(x) for x in v) if isinstance(v, list) else str(v or "")
+
+
+def fetch_jobicy(s: requests.Session) -> list[Job]:
+    jobs = []
+    for tag in ("devops", "sre", "kubernetes", "terraform"):
+        data = http_get(s, "https://jobicy.com/api/v2/remote-jobs", params={"count": 50, "tag": tag}).json()
+        for it in data.get("jobs", []):
+            jobs.append(Job(
+                source="Jobicy", title=_first(it, "jobTitle", "title"),
+                company=_first(it, "companyName", "company_name"),
+                location=_join(_first(it, "jobGeo", "geo", default="")),
+                url=it.get("url", ""), posted=parse_date(it.get("pubDate")),
+                salary=fmt_salary(_first(it, "annualSalaryMin", "salaryMin", default=0),
+                                  _first(it, "annualSalaryMax", "salaryMax", default=0),
+                                  _first(it, "salaryCurrency", default="USD")),
+                description=strip_html(_first(it, "jobDescription", "jobExcerpt", default="")),
+            ))
+        time.sleep(1)
+    return jobs
+
+
+def fetch_workingnomads(s: requests.Session) -> list[Job]:
+    data = http_get(s, "https://www.workingnomads.com/api/exposed_jobs/").json()
+    jobs = []
+    for it in data if isinstance(data, list) else data.get("jobs", []):
+        jobs.append(Job(
+            source="Working Nomads", title=_first(it, "title"),
+            company=_first(it, "company_name", "companyName", "company"),
+            location=_join(_first(it, "location", default="")), url=_first(it, "url"),
+            posted=parse_date(_first(it, "pub_date", "pubDate", default=None)),
+            description=strip_html(str(_first(it, "description"))) + " " + _join(_first(it, "tags", default="")),
+        ))
+    return jobs
+
+
+def _quick_skip(title: str, location: str, remote: bool) -> bool:
+    """Cheap pre-filter for company boards, so we only download details for plausible roles."""
+    if not TITLE_INCLUDE.search(title) or TITLE_EXCLUDE.search(title) or not remote:
+        return True
+    st = location_status(location)
+    return st == "blocked" or (st == "unclear" and not ALLOW_UNCLEAR_LOCATION)
+
+
+def _company_name(slug: str) -> str:
+    return slug.replace("-", " ").replace("_", " ").title()
+
+
+def fetch_greenhouse(s: requests.Session, slug: str) -> list[Job]:
+    base = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    data = http_get(s, base).json()
+    jobs = []
+    for it in data.get("jobs", []):
+        title = it.get("title", "")
+        loc = (it.get("location") or {}).get("name", "")
+        if _quick_skip(title, loc, "remote" in loc.lower()):
+            continue
+        detail = http_get(s, f"{base}/{it['id']}").json()
+        desc = strip_html(html.unescape(detail.get("content", "") or ""))
+        jobs.append(Job(
+            source="Company page", title=title, company=_company_name(slug), location=loc,
+            url=it.get("absolute_url", ""),
+            posted=parse_date(it.get("first_published") or it.get("updated_at")),
+            description=desc, trusted=True,
+        ))
+        time.sleep(0.3)
+    return jobs
+
+
+def fetch_lever(s: requests.Session, slug: str) -> list[Job]:
+    data = http_get(s, f"https://api.lever.co/v0/postings/{slug}", params={"mode": "json"}).json()
+    jobs = []
+    for it in data if isinstance(data, list) else []:
+        cats = it.get("categories") or {}
+        loc = _join(cats.get("allLocations") or cats.get("location") or "")
+        remote = it.get("workplaceType") == "remote" or "remote" in loc.lower()
+        title = it.get("text", "")
+        if _quick_skip(title, loc, remote):
+            continue
+        jobs.append(Job(
+            source="Company page", title=title, company=_company_name(slug), location=loc,
+            url=it.get("hostedUrl", ""), posted=parse_date(it.get("createdAt")),
+            description=it.get("descriptionPlain") or strip_html(it.get("description", "")), trusted=True,
+        ))
+    return jobs
+
+
+def fetch_ashby(s: requests.Session, slug: str) -> list[Job]:
+    data = http_get(s, f"https://api.ashbyhq.com/posting-api/job-board/{slug}",
+                    params={"includeCompensation": "true"}).json()
+    jobs = []
+    for it in data.get("jobs", []):
+        loc = it.get("location", "") or ""
+        remote = bool(it.get("isRemote")) or "remote" in loc.lower()
+        title = it.get("title", "")
+        if _quick_skip(title, loc, remote):
+            continue
+        jobs.append(Job(
+            source="Company page", title=title, company=_company_name(slug), location=loc,
+            url=it.get("jobUrl", ""), posted=parse_date(it.get("publishedAt")),
+            description=it.get("descriptionPlain") or strip_html(it.get("descriptionHtml", "")), trusted=True,
+        ))
+    return jobs
+
+
+def fetch_company_boards(s: requests.Session):
+    """Read company career pages. Returns (jobs, note) so wrong slugs are reported, not fatal."""
+    jobs: list[Job] = []
+    missing: list[str] = []
+    failed: list[str] = []
+    ok = 0
+    groups = (("greenhouse", GREENHOUSE_BOARDS, fetch_greenhouse),
+              ("lever", LEVER_BOARDS, fetch_lever),
+              ("ashby", ASHBY_BOARDS, fetch_ashby))
+    for kind, slugs, fn in groups:
+        for slug in slugs:
+            try:
+                jobs += fn(s, slug)
+                ok += 1
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    missing.append(f"{kind}:{slug}")
+                else:
+                    failed.append(f"{kind}:{slug}")
+            except Exception:
+                failed.append(f"{kind}:{slug}")
+            time.sleep(0.5)
+    note = f"{ok} boards read"
+    if missing:
+        note += f"; not found: {', '.join(missing)}"
+    if failed:
+        note += f"; errors: {', '.join(failed)}"
+    return jobs, note
+
+
 SOURCES = [
     ("Remotive", fetch_remotive),
     ("Remote OK", fetch_remoteok),
     ("We Work Remotely", fetch_wwr),
     ("Himalayas", fetch_himalayas),
+    ("Jobicy", fetch_jobicy),
+    ("Working Nomads", fetch_workingnomads),
+    ("Company career pages", fetch_company_boards),
 ]
 
 
@@ -346,6 +517,8 @@ def evaluate(j: Job, now: datetime) -> str | None:
     """Return None if the job is good, otherwise the reason it was dropped."""
     if not safe_url(j.url):
         return "invalid link"
+    if not j.remote_ok:
+        return "not remote"
     if (j.company or "").strip().lower() in COMPANY_BLOCKLIST:
         return "blocked company"
     if not TITLE_INCLUDE.search(j.title) or TITLE_EXCLUDE.search(j.title):
@@ -357,7 +530,7 @@ def evaluate(j: Job, now: datetime) -> str | None:
         return "not open to India"
     if loc == "unclear" and not ALLOW_UNCLEAR_LOCATION:
         return "location unclear"
-    if scam_flags(j):
+    if not j.trusted and scam_flags(j):
         return "suspected fake/scam"
     text = f"{j.title}\n{j.description}"
     yrs = min_years_required(text)
@@ -436,7 +609,7 @@ def build_html(jobs: list[Job], stats: Counter, status: dict, now: datetime) -> 
 <table style="border-collapse:collapse"><tr><th style='{th}'>Reason</th><th style='{th}'>Count</th></tr>{stat_rows}</table>
 <h3>Source status</h3>
 <table style="border-collapse:collapse"><tr><th style='{th}'>Source</th><th style='{th}'>Result</th></tr>{src_rows}</table>
-<p style="color:#777;font-size:12px">Jobs via Remotive, Remote OK, We Work Remotely and Himalayas. Please apply through the links above.</p>
+<p style="color:#777;font-size:12px">Jobs via Remotive, Remote OK, We Work Remotely, Himalayas, Jobicy, Working Nomads and company career pages. Please apply through the links above.</p>
 </div>"""
 
 
@@ -482,8 +655,11 @@ def main() -> None:
     for name, fn in SOURCES:
         try:
             got = fn(s)
+            note = ""
+            if isinstance(got, tuple):
+                got, note = got
             all_jobs += got
-            status[name] = f"{len(got)} fetched"
+            status[name] = f"{len(got)} fetched" + (f" ({note})" if note else "")
         except Exception as ex:  # one broken source must not stop the digest
             status[name] = f"FAILED ({type(ex).__name__})"
 
