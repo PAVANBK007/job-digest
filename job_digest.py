@@ -620,23 +620,45 @@ def build_text(jobs: list[Job], now: datetime) -> str:
     return "\n".join(lines)
 
 
+def parse_recipients(raw: str) -> list[str]:
+    """Accept commas, semicolons, spaces or new lines between addresses; drop quotes and duplicates."""
+    out: list[str] = []
+    for part in re.split(r"[,;\s]+", raw or ""):
+        addr = part.strip().strip("\"'<>")
+        if "@" in addr and addr.lower() not in [a.lower() for a in out]:
+            out.append(addr)
+    return out
+
+
 def send_email(subject: str, text: str, html_body: str) -> None:
-    user = os.environ.get("SMTP_USER")
-    pwd = os.environ.get("SMTP_APP_PASSWORD")
-    to = os.environ.get("EMAIL_TO") or user
-    if not (user and pwd and to):
+    user = os.environ.get("SMTP_USER", "").strip()
+    pwd = os.environ.get("SMTP_APP_PASSWORD", "").replace(" ", "").strip()
+    recipients = parse_recipients(os.environ.get("EMAIL_TO") or user)
+    if not (user and pwd and recipients):
         sys.exit("Set SMTP_USER, SMTP_APP_PASSWORD (and optionally EMAIL_TO) to send email.")
-    msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = subject, user, to
-    msg.set_content(text)
-    msg.add_alternative(html_body, subtype="html")
+    print(f"Sending to {len(recipients)} recipient(s): {', '.join(recipients)}")
+    sent, failed = [], []
     with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtp.gmail.com"), 465, timeout=30) as smtp:
         smtp.login(user, pwd)
-        refused = smtp.send_message(msg)
-    recipients = [addr for _, addr in getaddresses([msg["To"]]) if addr]
-    print(f"Email sent to {len(recipients)} recipient(s): {', '.join(recipients)}")
-    if refused:
-        print(f"WARNING - server refused these recipients: {', '.join(refused)}")
+        # One separate email per recipient, so a bad address cannot block the others.
+        for addr in recipients:
+            msg = EmailMessage()
+            msg["Subject"], msg["From"], msg["To"] = subject, user, addr
+            msg.set_content(text)
+            msg.add_alternative(html_body, subtype="html")
+            try:
+                refused = smtp.send_message(msg)
+                if refused:
+                    failed.append(f"{addr} ({refused[addr][0]})")
+                else:
+                    sent.append(addr)
+            except smtplib.SMTPException as e:
+                failed.append(f"{addr} ({type(e).__name__})")
+    print(f"Email accepted by Gmail for {len(sent)} of {len(recipients)}: {', '.join(sent) or 'none'}")
+    if failed:
+        print(f"WARNING - NOT delivered to: {', '.join(failed)}")
+    if not sent:
+        sys.exit("Email failed for every recipient.")
 
 
 # --------------------------------------------------------------------------
